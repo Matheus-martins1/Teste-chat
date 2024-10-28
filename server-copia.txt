@@ -1,0 +1,193 @@
+from flask import Flask, render_template, request, redirect, url_for, session
+from flask_socketio import SocketIO, emit
+import sqlite3
+import hashlib
+from gevent import monkey
+
+# Patch all for gevent
+monkey.patch_all()
+
+from flask import Flask
+from flask_socketio import SocketIO, emit
+
+app = Flask(__name__)
+socketio = SocketIO(app)
+
+# Lista para armazenar os grupos
+groups = []
+
+@app.route('/')
+def index():
+    return 'Servidor está rodando!'
+
+@socketio.on('connect')
+def handle_connect():
+    print('Um usuário se conectou')
+
+@socketio.on('createGroup')
+def handle_create_group(group_name):
+    # Verifica se o grupo já existe
+    if group_name not in groups:
+        groups.append(group_name)  # Adiciona o novo grupo à lista
+        emit('updateGroupList', groups, broadcast=True)  # Atualiza a lista de grupos para todos os usuários
+        emit('message', {'user': 'Sistema', 'message': f'Grupo "{group_name}" criado com sucesso!'})
+    else:
+        emit('message', {'user': 'Sistema', 'message': f'O grupo "{group_name}" já existe.'})
+
+@socketio.on('message')
+def handle_message(data):
+    # Aqui você pode implementar a lógica para gerenciar mensagens
+    print(f"Mensagem recebida de {data['user']}: {data['message']}")
+
+if __name__ == '__main__':
+    socketio.run(app, debug=True)
+
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+socketio = SocketIO(app, async_mode='gevent')
+
+# Função para obter uma conexão com o banco de dados
+def get_db_connection():
+    conn = sqlite3.connect('database.db')
+    conn.row_factory = sqlite3.Row  # Permite acessar colunas por nome
+    return conn
+
+# Função para criptografar a senha
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+# Inicialização do Banco de Dados
+def init_db():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''CREATE TABLE IF NOT EXISTS messages (user TEXT, message TEXT)'''
+        )
+        cursor.execute(
+            '''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT)'''
+        )
+        cursor.execute(
+            '''CREATE TABLE IF NOT EXISTS logins (username TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, success INTEGER)'''  # Tabela de logins
+        )
+        conn.commit()
+
+# Carrega mensagens antigas do banco de dados
+def load_messages(limit=None):
+    """
+    Carrega mensagens do banco de dados com um limite opcional.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        query = "SELECT * FROM messages ORDER BY rowid DESC"
+        if limit:
+            query += f" LIMIT {limit}"
+        cursor.execute(query)
+        return cursor.fetchall()[::-1]  # Inverte para ordem cronológica
+
+# Rota para a página inicial (registro e login)
+@app.route('/')
+def index():
+    return redirect(url_for('login'))
+
+# Rota para registro de usuário
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = hash_password(request.form['password'])
+
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "INSERT INTO users (username, password) VALUES (?, ?)", (username, password))
+                conn.commit()
+                return redirect(url_for('login'))
+            except sqlite3.IntegrityError:
+                return "Nome de usuário já existe. Escolha outro."
+    return render_template('register.html')
+
+# Rota para login de usuário
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = hash_password(request.form['password'])
+        
+
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM users WHERE username = ? AND password = ?", (username, password))
+            user = cursor.fetchone()
+
+            # Registrar tentativa de login no banco de dados
+            if user:
+                cursor.execute("INSERT INTO logins (username, success) VALUES (?, ?)", (username, 1))  # Login bem-sucedido
+                session['username'] = username
+                conn.commit()
+                return redirect(url_for('chat'))
+            else:
+                cursor.execute("INSERT INTO logins (username, success) VALUES (?, ?)", (username, 0))  # Login falhou
+                return "Usuário ou senha incorretos."
+        
+    return render_template('login.html')
+
+# Rota para a sala de chat
+@app.route('/chat')
+def chat():
+    if 'username' not in session:
+        return redirect(url_for('login'))
+    return render_template('chat.html')
+
+# Evento de conexão Socket.IO para carregar mensagens antigas
+@socketio.on('connect')
+def handle_connect():
+    username = session.get('username')
+    if not username:
+        return  # Ignora se o usuário não estiver autenticado
+
+    # Limite de mensagens a serem carregadas inicialmente
+    MESSAGE_LIMIT = 50
+    messages = load_messages(limit=MESSAGE_LIMIT)
+
+    # Envia as últimas mensagens carregadas ao cliente recém-conectado
+    for msg in messages:
+        emit('message', {'user': msg['user'], 'message': msg['message']})
+
+@socketio.on('message')
+def handle_message(data):
+    username = session.get('username')
+    if not username:
+        return  # Ignora se não houver usuário na sessão
+    
+
+    message = data['message']
+    print(f"{username}: {message}")
+
+    # Armazena a mensagem no banco de dados
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO messages (user, message) VALUES (?, ?)", (username, message))
+        conn.commit()
+
+    # Envia a mensagem para todos os usuários conectados
+    emit('message', {'user': username, 'message': message}, broadcast=True)
+
+
+# Rota para visualizar os registros de login
+@app.route('/login_logs')
+def login_logs():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM logins ORDER BY timestamp DESC")
+        logs = cursor.fetchall()
+        
+    return render_template('login_logs.html', logs=logs)
+
+# Executa o servidor
+if __name__ == '__main__':
+    init_db()
+    socketio.run(app, debug=True, port=5001)  # Alterando a porta para 5001
